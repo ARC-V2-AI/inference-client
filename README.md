@@ -14,8 +14,6 @@ The client wraps the runtime's HTTP API and keeps application logic on the clien
 uv add git+https://github.com/ARC-V2-AI/inference-client.git
 ```
 
-The repository name is the recommended target; update the URL if it has not been renamed yet.
-
 ## Quick start
 
 ```python
