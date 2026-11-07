@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "arc-v2-inference-client"
-version = "2.0.0"
+version = "3.0.0"
 description = "Python client and agent SDK for the ARC V2 inference runtime"
 readme = "README.md"
 requires-python = ">=3.11"
