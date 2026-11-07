@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import time
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
@@ -43,57 +44,6 @@ def _parse_structured(text: str, model: type[T] | None) -> T | None:
     return model(**data)  # type: ignore[call-arg,return-value]
 
 
-def _tool_messages(
-    response: ChatResponse,
-    tools: dict[str, Tool],
-    *,
-    error_mode: str,
-    trace: list[AgentEvent],
-    include_trace: bool,
-    iteration: int,
-) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
-    for call in response.tool_calls:
-        if include_trace:
-            trace.append(AgentEvent("tool_call_started", {
-                "iteration": iteration,
-                "call_id": call.id,
-                "name": call.name,
-                "arguments": call.arguments_dict(),
-            }))
-        started_at = time.perf_counter()
-        try:
-            spec = tools.get(call.name)
-            if spec is None:
-                raise ToolExecutionError(f"Unknown tool: {call.name}")
-            result = spec.execute(call.arguments)
-            success = True
-            error = None
-        except Exception as exc:
-            if error_mode == "raise":
-                raise
-            result = serialize_result({"ok": False, "error": str(exc)})
-            success = False
-            error = str(exc)
-        messages.append({
-            "role": "tool",
-            "tool_call_id": call.id,
-            "name": call.name,
-            "content": result,
-        })
-        if include_trace:
-            trace.append(AgentEvent("tool_call_completed", {
-                "iteration": iteration,
-                "call_id": call.id,
-                "name": call.name,
-                "result": result,
-                "duration_ms": (time.perf_counter() - started_at) * 1000,
-                "success": success,
-                "error": error,
-            }))
-    return messages
-
-
 def _response_from_stream(events: list[StreamEvent]) -> ChatResponse:
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
@@ -117,8 +67,13 @@ def _response_from_stream(events: list[StreamEvent]) -> ChatResponse:
                 state["name"] += call.name
             if call.arguments:
                 state["arguments"] += call.arguments
+
     tool_calls = [
-        {"id": value["id"], "type": "function", "function": {"name": value["name"], "arguments": value["arguments"]}}
+        {
+            "id": value["id"],
+            "type": "function",
+            "function": {"name": value["name"], "arguments": value["arguments"]},
+        }
         for _, value in sorted(calls.items())
     ]
     message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts) or None}
@@ -134,11 +89,60 @@ def _response_from_stream(events: list[StreamEvent]) -> ChatResponse:
     })
 
 
-class Agent:
-    """A small tool-execution loop built on persisted runtime conversations.
+def _tool_messages(
+    calls: list[ToolCall],
+    tools: dict[str, Tool],
+    *,
+    error_mode: str,
+    trace: _TraceEvents,
+    include_trace: bool,
+    iteration: int,
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    for call in calls:
+        if include_trace:
+            trace.append(AgentEvent("tool_call_started", {
+                "iteration": iteration,
+                "call_id": call.id,
+                "name": call.name,
+                "arguments": call.arguments_dict(),
+            }))
+        started_at = time.perf_counter()
+        try:
+            spec = tools.get(call.name)
+            if spec is None:
+                raise ToolExecutionError(f"Unknown tool: {call.name}")
+            result = spec.execute(call.arguments)
+            success, error = True, None
+        except Exception as exc:
+            if error_mode == "raise":
+                raise
+            result = serialize_result({"ok": False, "error": str(exc)})
+            success, error = False, str(exc)
+        messages.append({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "name": call.name,
+            "content": result,
+        })
+        if include_trace:
+            trace.append(AgentEvent("tool_call_completed", {
+                "iteration": iteration,
+                "call_id": call.id,
+                "name": call.name,
+                "result": result,
+                "duration_ms": (time.perf_counter() - started_at) * 1000,
+                "success": success,
+                "error": error,
+            }))
+    return messages
 
-    The runtime stores assistant tool-call messages and tool-result messages.
-    The SDK therefore sends only the new user or tool messages for each round.
+
+class Agent:
+    """Client-side agent with local message history and a stateless runtime.
+
+    The complete message list is submitted on every inference request.  The
+    runtime does not persist transcripts or own the agent's working memory.
     """
 
     def __init__(
@@ -154,6 +158,9 @@ class Agent:
         temperature: float | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
+        context_limit: int | None = None,
+        context_overflow: str = "truncate",
         reasoning_effort: str | None = None,
         tool_error_mode: str = "message",
         trace_callback: Any = None,
@@ -172,28 +179,55 @@ class Agent:
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
+            "min_p": min_p,
+            "context_limit": context_limit,
+            "context_overflow": context_overflow,
             "reasoning_effort": reasoning_effort,
         }
         self.tool_error_mode = tool_error_mode
         self.trace_callback = trace_callback
-        self.title = title
+        self.title = title  # retained as a constructor compatibility field; not stored by the server
         self.tools: dict[str, Tool] = {}
-        self._conversation = None
+        self._messages: list[dict[str, Any]] = []
+        if self.instructions:
+            self._messages.append({"role": "system", "content": self.instructions})
         self.last_result: AgentResult | None = None
         self.add_tools(tools)
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        """Current local working transcript (mutable copy)."""
+        return copy.deepcopy(self._messages)
 
     def add_tools(self, tools: Iterable[Any]) -> None:
         for value in tools:
             spec = ensure_tool(value)
             self.tools[spec.name] = spec
 
-    def _ensure_conversation(self):
-        if self._conversation is None:
-            self._conversation = self.client.conversations.create(
-                title=self.title,
-                system=self.instructions,
-            )
-        return self._conversation
+    def reset(self) -> None:
+        """Discard this agent's local working history, keeping its instructions."""
+        self._messages = []
+        if self.instructions:
+            self._messages.append({"role": "system", "content": self.instructions})
+        self.last_result = None
+
+    def export_state(self) -> dict[str, Any]:
+        """Return serializable agent history for storage by the caller."""
+        return {"messages": self.messages}
+
+    def restore_state(self, state: Mapping[str, Any]) -> None:
+        messages = state.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError("Agent state must contain a messages list")
+        # Validate supported message containers and copy them to avoid retaining
+        # caller-owned mutable dictionaries.
+        normalized = [copy.deepcopy(dict(message)) for message in messages if isinstance(message, Mapping)]
+        if len(normalized) != len(messages):
+            raise ValueError("Every agent message must be a mapping")
+        if self.instructions and (not normalized or normalized[0].get("role") != "system"):
+            normalized.insert(0, {"role": "system", "content": self.instructions})
+        self._messages = normalized
+        self.last_result = None
 
     def run(
         self,
@@ -204,13 +238,12 @@ class Agent:
         **kwargs: Any,
     ) -> AgentResult:
         started_at = time.perf_counter()
-        conversation = self._ensure_conversation()
+        self._messages.append({"role": "user", "content": prompt})
         params = {key: value for key, value in self.defaults.items() if value is not None}
         params.update(kwargs)
         if response_model is not None:
             params.setdefault("response_format", {"type": "json_object"})
         tool_definitions = [spec.definition() for spec in self.tools.values()]
-        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         trace_events = _TraceEvents(trace, self.trace_callback)
         if trace:
             trace_events.append(AgentEvent("agent_started", {"prompt": prompt}))
@@ -220,40 +253,47 @@ class Agent:
             if tool_definitions:
                 request["tools"] = tool_definitions
                 request["tool_choice"] = self.tool_choice
-            response = conversation.complete(messages, **request)
+            response = self.client.chat.create(self._messages, stream=False, **request)
             if trace:
                 trace_events.append(AgentEvent("model_response", {
                     "iteration": iteration,
                     "finish_reason": response.finish_reason,
                     "text": response.text,
                 }))
+            assistant_message = response.message
+            self._messages.append(assistant_message)
             if not response.tool_calls:
                 parsed = _parse_structured(response.text, response_model)
                 if trace:
                     trace_events.append(AgentEvent("agent_completed", {"iteration": iteration}))
-                result = AgentResult(response.text, response, conversation.id, _trace_snapshot(trace_events, started_at, trace), parsed)
+                result = AgentResult(
+                    response.text, response,
+                    _trace_snapshot(trace_events, started_at, trace), parsed
+                )
                 self.last_result = result
                 return result
-            messages = _tool_messages(
-                response,
+            self._messages.extend(_tool_messages(
+                response.tool_calls,
                 self.tools,
                 error_mode=self.tool_error_mode,
                 trace=trace_events,
                 include_trace=trace,
                 iteration=iteration,
-            )
+            ))
         raise AgentLoopError(f"Agent exceeded max_iterations={self.max_iterations}")
 
-    def stream(self, prompt: str, *, trace: bool = False, **kwargs: Any) -> Iterator[StreamEvent | AgentEvent]:
+    def stream(
+        self, prompt: str, *, trace: bool = False, **kwargs: Any
+    ) -> Iterator[StreamEvent | AgentEvent]:
         started_at = time.perf_counter()
-        conversation = self._ensure_conversation()
+        self._messages.append({"role": "user", "content": prompt})
         params = {key: value for key, value in self.defaults.items() if value is not None}
         params.update(kwargs)
         tool_definitions = [spec.definition() for spec in self.tools.values()]
-        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         trace_events = _TraceEvents(trace, self.trace_callback)
         if trace:
             trace_events.append(AgentEvent("agent_started", {"prompt": prompt}))
+
         for iteration in range(1, self.max_iterations + 1):
             request = dict(params)
             request["stream"] = True
@@ -261,56 +301,48 @@ class Agent:
                 request["tools"] = tool_definitions
                 request["tool_choice"] = self.tool_choice
             received: list[StreamEvent] = []
-            for event in conversation.stream_messages(messages, **request):
+            for event in self.client.chat.create(self._messages, **request):
                 received.append(event)
                 yield event
             response = _response_from_stream(received)
+            self._messages.append(response.message)
+            if trace:
+                trace_events.append(AgentEvent("model_response", {
+                    "iteration": iteration,
+                    "finish_reason": response.finish_reason,
+                    "text": response.text,
+                }))
             if not response.tool_calls:
+                self.last_result = AgentResult(
+                    response.text, response,
+                    _trace_snapshot(trace_events, started_at, trace)
+                )
                 if trace:
-                    trace_events.append(AgentEvent("agent_completed", {"iteration": iteration}))
-                self.last_result = AgentResult(response.text, response, conversation.id, _trace_snapshot(trace_events, started_at, trace))
+                    event = AgentEvent("agent_completed", {"iteration": iteration})
+                    trace_events.append(event)
+                    yield event
                 return
-            messages = []
-            for call in response.tool_calls:
-                started = AgentEvent("tool_call_started", {
-                    "iteration": iteration, "call_id": call.id, "name": call.name,
-                    "arguments": call.arguments_dict(),
-                })
-                if trace:
-                    trace_events.append(started)
-                    yield started
-                started_at = time.perf_counter()
-                try:
-                    spec = self.tools.get(call.name)
-                    if spec is None:
-                        raise ToolExecutionError(f"Unknown tool: {call.name}")
-                    content = spec.execute(call.arguments)
-                    success, error = True, None
-                except Exception as exc:
-                    if self.tool_error_mode == "raise":
-                        raise
-                    content = serialize_result({"ok": False, "error": str(exc)})
-                    success, error = False, str(exc)
-                messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": content})
-                completed = AgentEvent("tool_call_completed", {
-                    "iteration": iteration, "call_id": call.id, "name": call.name,
-                    "result": content, "duration_ms": (time.perf_counter() - started_at) * 1000,
-                    "success": success, "error": error,
-                })
-                if trace:
-                    trace_events.append(completed)
-                    yield completed
+            try:
+                tool_results = _tool_messages(
+                    response.tool_calls,
+                    self.tools,
+                    error_mode=self.tool_error_mode,
+                    trace=trace_events,
+                    include_trace=trace,
+                    iteration=iteration,
+                )
+            except Exception:
+                raise
+            self._messages.extend(tool_results)
+            if trace:
+                # Emit the tool events added since the last trace emission.
+                for event in trace_events[-(2 * len(tool_results)):]:
+                    yield event
         raise AgentLoopError(f"Agent exceeded max_iterations={self.max_iterations}")
-
-    def reset(self) -> None:
-        # Keep the previous server-side transcript for inspection; a new run will
-        # receive a new persisted conversation.
-        self._conversation = None
-        self.last_result = None
 
 
 class AsyncAgent:
-    """Asynchronous counterpart to :class:`Agent`, including async tools."""
+    """Asynchronous client-side agent with local transcript ownership."""
 
     def __init__(
         self,
@@ -325,6 +357,9 @@ class AsyncAgent:
         temperature: float | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
+        min_p: float | None = None,
+        context_limit: int | None = None,
+        context_overflow: str = "truncate",
         reasoning_effort: str | None = None,
         tool_error_mode: str = "message",
         trace_callback: Any = None,
@@ -343,28 +378,50 @@ class AsyncAgent:
             "temperature": temperature,
             "top_p": top_p,
             "top_k": top_k,
+            "min_p": min_p,
+            "context_limit": context_limit,
+            "context_overflow": context_overflow,
             "reasoning_effort": reasoning_effort,
         }
         self.tool_error_mode = tool_error_mode
         self.trace_callback = trace_callback
         self.title = title
         self.tools: dict[str, Tool] = {}
-        self._conversation = None
+        self._messages: list[dict[str, Any]] = []
+        if self.instructions:
+            self._messages.append({"role": "system", "content": self.instructions})
         self.last_result: AgentResult | None = None
         self.add_tools(tools)
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(self._messages)
 
     def add_tools(self, tools: Iterable[Any]) -> None:
         for value in tools:
             spec = ensure_tool(value)
             self.tools[spec.name] = spec
 
-    async def _ensure_conversation(self):
-        if self._conversation is None:
-            self._conversation = await self.client.conversations.create(
-                title=self.title,
-                system=self.instructions,
-            )
-        return self._conversation
+    def reset(self) -> None:
+        self._messages = []
+        if self.instructions:
+            self._messages.append({"role": "system", "content": self.instructions})
+        self.last_result = None
+
+    def export_state(self) -> dict[str, Any]:
+        return {"messages": self.messages}
+
+    def restore_state(self, state: Mapping[str, Any]) -> None:
+        messages = state.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError("Agent state must contain a messages list")
+        normalized = [copy.deepcopy(dict(message)) for message in messages if isinstance(message, Mapping)]
+        if len(normalized) != len(messages):
+            raise ValueError("Every agent message must be a mapping")
+        if self.instructions and (not normalized or normalized[0].get("role") != "system"):
+            normalized.insert(0, {"role": "system", "content": self.instructions})
+        self._messages = normalized
+        self.last_result = None
 
     async def run(
         self,
@@ -375,41 +432,50 @@ class AsyncAgent:
         **kwargs: Any,
     ) -> AgentResult:
         started_at = time.perf_counter()
-        conversation = await self._ensure_conversation()
+        self._messages.append({"role": "user", "content": prompt})
         params = {key: value for key, value in self.defaults.items() if value is not None}
         params.update(kwargs)
         if response_model is not None:
             params.setdefault("response_format", {"type": "json_object"})
         tool_definitions = [spec.definition() for spec in self.tools.values()]
-        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         trace_events = _TraceEvents(trace, self.trace_callback)
         if trace:
             trace_events.append(AgentEvent("agent_started", {"prompt": prompt}))
+
         for iteration in range(1, self.max_iterations + 1):
             request = dict(params)
             if tool_definitions:
                 request["tools"] = tool_definitions
                 request["tool_choice"] = self.tool_choice
-            response = await conversation.complete(messages, **request)
+            response = await self.client.chat.create(self._messages, stream=False, **request)
+            assistant_message = response.message
+            self._messages.append(assistant_message)
             if trace:
                 trace_events.append(AgentEvent("model_response", {
-                    "iteration": iteration, "finish_reason": response.finish_reason, "text": response.text,
+                    "iteration": iteration,
+                    "finish_reason": response.finish_reason,
+                    "text": response.text,
                 }))
             if not response.tool_calls:
                 parsed = _parse_structured(response.text, response_model)
                 if trace:
                     trace_events.append(AgentEvent("agent_completed", {"iteration": iteration}))
-                result = AgentResult(response.text, response, conversation.id, _trace_snapshot(trace_events, started_at, trace), parsed)
+                result = AgentResult(
+                    response.text, response,
+                    _trace_snapshot(trace_events, started_at, trace), parsed
+                )
                 self.last_result = result
                 return result
-            messages = []
+
             for call in response.tool_calls:
                 if trace:
                     trace_events.append(AgentEvent("tool_call_started", {
-                        "iteration": iteration, "call_id": call.id, "name": call.name,
+                        "iteration": iteration,
+                        "call_id": call.id,
+                        "name": call.name,
                         "arguments": call.arguments_dict(),
                     }))
-                started_at = time.perf_counter()
+                tool_started = time.perf_counter()
                 try:
                     spec = self.tools.get(call.name)
                     if spec is None:
@@ -421,25 +487,34 @@ class AsyncAgent:
                         raise
                     content = serialize_result({"ok": False, "error": str(exc)})
                     success, error = False, str(exc)
-                messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": content})
+                self._messages.append({
+                    "role": "tool", "tool_call_id": call.id,
+                    "name": call.name, "content": content,
+                })
                 if trace:
                     trace_events.append(AgentEvent("tool_call_completed", {
-                        "iteration": iteration, "call_id": call.id, "name": call.name,
-                        "result": content, "duration_ms": (time.perf_counter() - started_at) * 1000,
-                        "success": success, "error": error,
+                        "iteration": iteration,
+                        "call_id": call.id,
+                        "name": call.name,
+                        "result": content,
+                        "duration_ms": (time.perf_counter() - tool_started) * 1000,
+                        "success": success,
+                        "error": error,
                     }))
         raise AgentLoopError(f"Agent exceeded max_iterations={self.max_iterations}")
 
-    async def stream(self, prompt: str, *, trace: bool = False, **kwargs: Any) -> AsyncIterator[StreamEvent | AgentEvent]:
+    async def stream(
+        self, prompt: str, *, trace: bool = False, **kwargs: Any
+    ) -> AsyncIterator[StreamEvent | AgentEvent]:
         started_at = time.perf_counter()
-        conversation = await self._ensure_conversation()
+        self._messages.append({"role": "user", "content": prompt})
         params = {key: value for key, value in self.defaults.items() if value is not None}
         params.update(kwargs)
         tool_definitions = [spec.definition() for spec in self.tools.values()]
-        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         trace_events = _TraceEvents(trace, self.trace_callback)
         if trace:
             trace_events.append(AgentEvent("agent_started", {"prompt": prompt}))
+
         for iteration in range(1, self.max_iterations + 1):
             request = dict(params)
             request["stream"] = True
@@ -447,25 +522,35 @@ class AsyncAgent:
                 request["tools"] = tool_definitions
                 request["tool_choice"] = self.tool_choice
             received: list[StreamEvent] = []
-            async for event in conversation.stream_messages(messages, **request):
+            async for event in await self.client.chat.create(self._messages, **request):
                 received.append(event)
                 yield event
             response = _response_from_stream(received)
+            self._messages.append(response.message)
+            if trace:
+                trace_events.append(AgentEvent("model_response", {
+                    "iteration": iteration,
+                    "finish_reason": response.finish_reason,
+                    "text": response.text,
+                }))
             if not response.tool_calls:
+                self.last_result = AgentResult(
+                    response.text, response,
+                    _trace_snapshot(trace_events, started_at, trace)
+                )
                 if trace:
-                    trace_events.append(AgentEvent("agent_completed", {"iteration": iteration}))
-                self.last_result = AgentResult(response.text, response, conversation.id, _trace_snapshot(trace_events, started_at, trace))
+                    event = AgentEvent("agent_completed", {"iteration": iteration})
+                    trace_events.append(event)
+                    yield event
                 return
-            messages = []
+
             for call in response.tool_calls:
-                started = AgentEvent("tool_call_started", {
-                    "iteration": iteration, "call_id": call.id, "name": call.name,
-                    "arguments": call.arguments_dict(),
-                })
                 if trace:
-                    trace_events.append(started)
-                    yield started
-                started_at = time.perf_counter()
+                    trace_events.append(AgentEvent("tool_call_started", {
+                        "iteration": iteration, "call_id": call.id,
+                        "name": call.name, "arguments": call.arguments_dict(),
+                    }))
+                tool_started = time.perf_counter()
                 try:
                     spec = self.tools.get(call.name)
                     if spec is None:
@@ -477,17 +562,17 @@ class AsyncAgent:
                         raise
                     content = serialize_result({"ok": False, "error": str(exc)})
                     success, error = False, str(exc)
-                messages.append({"role": "tool", "tool_call_id": call.id, "name": call.name, "content": content})
-                completed = AgentEvent("tool_call_completed", {
-                    "iteration": iteration, "call_id": call.id, "name": call.name,
-                    "result": content, "duration_ms": (time.perf_counter() - started_at) * 1000,
-                    "success": success, "error": error,
+                self._messages.append({
+                    "role": "tool", "tool_call_id": call.id,
+                    "name": call.name, "content": content,
                 })
                 if trace:
-                    trace_events.append(completed)
-                    yield completed
+                    event = AgentEvent("tool_call_completed", {
+                        "iteration": iteration, "call_id": call.id,
+                        "name": call.name, "result": content,
+                        "duration_ms": (time.perf_counter() - tool_started) * 1000,
+                        "success": success, "error": error,
+                    })
+                    trace_events.append(event)
+                    yield event
         raise AgentLoopError(f"Agent exceeded max_iterations={self.max_iterations}")
-
-    def reset(self) -> None:
-        self._conversation = None
-        self.last_result = None

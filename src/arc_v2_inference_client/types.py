@@ -251,27 +251,6 @@ class ChatContext:
 
 
 @dataclass(frozen=True, slots=True)
-class ConversationInfo:
-    raw: JSON
-
-    @property
-    def id(self) -> str:
-        value = self.raw.get("id")
-        if value is None:
-            raise ValueError("Conversation response did not contain an id")
-        return str(value)
-
-    @property
-    def title(self) -> str | None:
-        value = self.raw.get("title")
-        return str(value) if value is not None else None
-
-    @property
-    def messages(self) -> list[JSON]:
-        return [dict(_mapping(item)) for item in (self.raw.get("messages") or [])]
-
-
-@dataclass(frozen=True, slots=True)
 class EmbeddingResponse:
     raw: JSON
 
@@ -327,7 +306,6 @@ class AgentTrace:
 class AgentResult:
     text: str
     response: ChatResponse
-    conversation_id: str | None = None
     trace: AgentTrace | None = None
     parsed: Any | None = None
 

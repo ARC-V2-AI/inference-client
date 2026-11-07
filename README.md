@@ -2,11 +2,11 @@
 
 # ARC V2 Inference Client
 
-**A small Python client for the ARC V2 inference runtime.**
+**Python client and local agent SDK for the ARC V2 inference runtime.**
 
 </div>
 
-The client wraps the runtime's HTTP API and keeps application logic on the client side. It supports direct chat/completions, streaming, model metadata, exact token/context inspection, persistent conversations, embeddings, and a basic tool-agent loop.
+The client provides stateless chat/completion requests, streaming, token/context inspection, runtime resource controls, embeddings and synchronous/asynchronous tool agents. Agent message history is owned by the client process; the inference server does not persist conversations.
 
 ## Install
 
@@ -14,101 +14,54 @@ The client wraps the runtime's HTTP API and keeps application logic on the clien
 uv add git+https://github.com/ARC-V2-AI/inference-client.git
 ```
 
-The repository name is the recommended target; update the URL if it has not been renamed yet.
-
 ## Quick start
 
 ```python
 from arc_v2_inference_client import InferenceClient
 
 with InferenceClient("http://127.0.0.1:7842") as client:
-    response = client.chat.create([
-        {"role": "system", "content": "You are a concise assistant."},
-        {"role": "user", "content": "Explain ARC V2 in one sentence."},
-    ], temperature=0.2)
+    response = client.chat.create(
+        [
+            {"role": "system", "content": "You are a concise assistant."},
+            {"role": "user", "content": "Explain ARC V2 in one sentence."},
+        ],
+        stream=False,
+        max_output_tokens=256,
+        context_limit=4096,
+        context_overflow="reject",
+    )
     print(response.text)
+    print(response.usage)
 ```
 
-Pass either the server root (`http://127.0.0.1:7842`) or the API root (`http://127.0.0.1:7842/v1`). The client normalizes both forms.
+Pass either the server root (`http://127.0.0.1:7842`) or `/v1` API root. The client normalizes both forms.
 
-## Runtime-native APIs
-
-### Model and tokenization
-
-```python
-model = client.model.get()
-print(model.id, model.tool_protocol, model.supports_tools)
-
-counts = client.tokenize(
-    ["First prompt", "Second prompt"],
-    include_tokens=False,
-)
-print(counts.token_counts, counts.total_tokens)
-```
-
-`client.models.list()` calls `/v1/models`; `client.model.get()` calls the runtime's `/v1/model`. Tokenization uses `/v1/tokenize`, which can optionally return token IDs.
-
-### Exact context accounting
-
-```python
-context = client.chat.context(
-    [{"role": "user", "content": "Can this prompt fit?"}],
-    max_output_tokens=512,
-    tools=[],
-)
-
-print(context.prompt_tokens, context.fits, context.remaining_tokens)
-```
-
-Context accounting calls `/v1/chat/context` so the runtime can render and count the prompt using the loaded model's actual chat template. This is more reliable than estimating tokens from message character length.
-
-### Persisted conversations
+## Token and context control
 
 ```python
 with InferenceClient() as client:
-    conversation = client.conversation(
-        system="You are a helpful, concise assistant.",
-        title="First conversation",
+    tokens = client.tokenize("How many tokens is this?")
+    print(tokens.total_tokens)
+
+    context = client.chat.context(
+        [{"role": "user", "content": "Can this prompt fit?"}],
+        max_output_tokens=512,
+        context_limit=4096,
+        context_overflow="reject",
     )
-
-    print(conversation.send("Hello").text)
-    print(conversation.send("What did I just say?").text)
-    print(conversation.id)
-
-    saved = client.conversations.get(conversation.id)
-    print(saved.messages)
+    print(context.prompt_tokens, context.fits, context.remaining_tokens)
 ```
 
-Conversations are stored by the runtime. The client sends only new messages to `/v1/conversations/{id}/chat/completions`; it does **not** resend the transcript on every turn. Use `client.conversations.list()` and `client.conversations.delete(id)` for transcript management. Context pruning during generation does not erase the stored transcript.
+The server renders messages using the loaded model's native chat template and counts them with its tokenizer. `context_limit` can restrict one request below the server's configured window. `context_overflow` accepts `"reject"` or `"truncate"` (oldest complete user turns are removed only in truncate mode).
 
-### Streaming
+Responses expose token usage:
 
 ```python
-for event in conversation.stream("Explain tool calling"):
-    if event.type == "text":
-        print(event.text, end="", flush=True)
+print(response.usage)
+# {"prompt_tokens": ..., "completion_tokens": ..., "total_tokens": ...}
 ```
 
-The stream exposes text, reasoning fragments, tool-call deltas, finish information, and the raw event payload. The caller controls what to display or record.
-
-### Embeddings
-
-```python
-embeddings = client.embeddings.create(
-    ["Passage to index", "Another passage"],
-    input_type="document",
-)
-
-query_embedding = client.embeddings.create(
-    "Find passages about local inference",
-    input_type="query",
-    instruction="Retrieve documents relevant to the user's question.",
-)
-```
-
-The runtime may return HTTP 503 when its dedicated embedding model is not configured. The client surfaces the server error rather than silently switching to the chat model.
-
-## Tools and agents
+## Local agent history
 
 ```python
 from arc_v2_inference_client import InferenceClient, tool
@@ -123,45 +76,107 @@ with InferenceClient() as client:
         instructions="Use tools when helpful. Be concise.",
         tools=[add],
         max_iterations=8,
+        max_output_tokens=512,
     )
-    result = agent.run("What is 12 + 30?", trace=True)
-    print(result.text)
-    print(result.conversation_id)
-    for event in result.trace.events:
-        print(event.type, event.data)
+
+    first = agent.run("What is 12 + 30?")
+    second = agent.run("Multiply that result by two.")
+    print(first.text, second.text)
+
+    # History remains in this Agent instance, not on the server.
+    state = agent.export_state()
+    agent.reset()
+    agent.restore_state(state)
 ```
 
-The agent executes registered Python functions locally. Tool schemas are inferred from type hints and docstrings; provide an explicit JSON Schema to `@tool(parameters=...)` when inference is insufficient. Only register tools that are appropriate for the prompts and permissions in your application.
+The agent sends its complete local message list with each inference request. Assistant tool-call messages and tool results are appended locally so multi-step tool loops remain coherent. `reset()` discards that agent's working transcript. `export_state()` and `restore_state()` let the caller persist or restore it using its own storage mechanism.
 
-For async applications, use `AsyncInferenceClient` and `await client.chat.create(...)`, `await client.conversation(...)`, or `await client.agent(...).run(...)`. Async agents support both normal and `async def` tools.
+Agents are independent client-side objects. A main agent can pause while a temporary subagent runs through the same inference client. The runtime serializes their inference requests and clears shared KV contents after each generation. The subagent should be discarded after its result is returned; its local transcript is then released with the object. This does not create per-agent GPU allocations or retained KV sessions.
 
-## Stateless API surface
+## Streaming
 
-| Method | Runtime route | Purpose |
-| --- | --- | --- |
-| `client.chat.create(...)` | `POST /v1/chat/completions` | One stateless chat request |
+```python
+for event in client.chat.create(
+    [{"role": "user", "content": "Explain tool calling."}],
+    stream=True,
+):
+    if event.type == "text":
+        print(event.text, end="", flush=True)
+```
+
+The stream exposes text, reasoning fragments, tool-call deltas, finish information and the raw event payload. Final usage is included in the final event's raw data.
+
+## Embeddings
+
+```python
+embeddings = client.embeddings.create(
+    ["Passage to index", "Another passage"],
+    input_type="document",
+)
+
+query_embedding = client.embeddings.create(
+    "Find passages about local inference",
+    input_type="query",
+    instruction="Retrieve documents relevant to the user's question.",
+)
+```
+
+The runtime returns HTTP 503 when a dedicated embedding model is not configured and fallback is disabled.
+
+## Runtime resource inspection
+
+```python
+with InferenceClient() as client:
+    print(client.runtime.status())
+    print(client.runtime.memory())
+    client.runtime.clear_cache()
+```
+
+`clear_cache()` is a global administrative operation that clears the active shared KV sequence. The shared KV allocation remains reserved for reuse; it is not an operation that returns the model's allocated VRAM to the operating system. Do not call it concurrently with work that expects retained inference state. The current runtime has no retained per-agent KV sessions.
+
+## Async usage
+
+```python
+from arc_v2_inference_client import AsyncInferenceClient
+
+async with AsyncInferenceClient() as client:
+    agent = client.agent(instructions="You are concise.")
+    result = await agent.run("Hello")
+    print(result.text)
+    print(await client.runtime.memory())
+```
+
+Async agents support synchronous and `async def` tools.
+
+## API surface
+
+| Client method | Runtime route | Purpose |
+|---|---|---|
+| `client.chat.create(...)` | `POST /v1/chat/completions` | Stateless chat and streaming |
 | `client.completions.create(...)` | `POST /v1/completions` | Text completion |
-| `client.embeddings.create(...)` | `POST /v1/embeddings` | Vector embeddings |
-| `client.model.get()` | `GET /v1/model` | Loaded-model metadata and capabilities |
+| `client.embeddings.create(...)` | `POST /v1/embeddings` | Embeddings |
+| `client.model.get()` | `GET /v1/model` | Model metadata |
 | `client.models.list()` | `GET /v1/models` | Model listing |
-| `client.tokenize(...)` | `POST /v1/tokenize` | Native tokenizer counts / IDs |
-| `client.chat.context(...)` | `POST /v1/chat/context` | Exact rendered-prompt budget |
-| `client.conversations.*` | `/v1/conversations` | Persistent transcript lifecycle |
+| `client.tokenize(...)` | `POST /v1/tokenize` | Token counts and IDs |
+| `client.chat.context(...)` | `POST /v1/context/inspect` | Rendered prompt budget |
+| `client.runtime.status()` | `GET /v1/runtime/status` | Runtime and queue state |
+| `client.runtime.memory()` | `GET /v1/runtime/memory` | Process and GPU memory snapshot |
+| `client.runtime.clear_cache()` | `POST /v1/runtime/cache/clear` | Global KV-content clear |
 
-## Migration and naming
+## Migration from persisted conversations
 
-The distribution and import names are now aligned with the server counterpart:
+- Replace `client.conversation(...)` with `client.agent(...)` or maintain your own `messages` list and call `client.chat.create(messages, stream=False)`.
+- Replace `client.conversations.*` with caller-owned persistence using `Agent.export_state()` / `restore_state()`.
+- Each chat request must now include the complete message history.
+- `AgentResult` no longer exposes a server conversation ID; agent history belongs to the client.
 
-- Distribution: `arc-v2-inference-client`
-- Import: `arc_v2_inference_client`
-- Server distribution: `arc-v2-inference-runtime`
-- Server import: `arc_v2_inference_runtime`
-
-The existing `arc_inference` package can remain in the project for a migration period. New application code should use `arc_v2_inference_client` so the client/runtime relationship is explicit. Rename the GitHub repository to `ARC-V2-AI/inference-client` when repository ownership and downstream install URLs are ready to be updated.
+The previous SQLite conversation database is no longer read or modified by the runtime. Back it up or export its contents before removing it manually.
 
 ## Design boundaries
 
-- The runtime owns model loading, tokenization, actual prompt rendering, context-window enforcement, and persistent transcript storage.
-- The client owns HTTP transport, typed response helpers, local tool execution, and application-facing convenience methods.
-- Conversation generation sends only newly added messages. Sending the full stored transcript again duplicates history.
-- The SDK does not infer server-side model capabilities from model names; use `/v1/model` metadata.
+- Runtime: model lifecycle, native rendering/tokenization, context enforcement, serialized inference and KV cleanup.
+- Client/Agent: working transcript, tool execution, agent orchestration and local state export/restore.
+- ARC Memory Manager: long-term/episodic/semantic memory and summarization should remain a separate ARC service or client-side component.
+- KV cache: an inference performance resource, not persistent agent memory.
+
+The runtime API currently has no authentication. Keep the service bound to localhost unless protected by an authenticated gateway.

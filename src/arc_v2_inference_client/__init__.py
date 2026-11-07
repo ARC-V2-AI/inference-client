@@ -11,7 +11,6 @@ from .types import (
     ChatContext,
     ChatMessage,
     ChatResponse,
-    ConversationInfo,
     EmbeddingResponse,
     ModelInfo,
     StreamEvent,
@@ -22,7 +21,7 @@ from .types import (
 
 Client = InferenceClient
 AsyncClient = AsyncInferenceClient
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 
 __all__ = [
     "Agent",
@@ -37,7 +36,6 @@ __all__ = [
     "ChatMessage",
     "ChatResponse",
     "Client",
-    "ConversationInfo",
     "EmbeddingResponse",
     "InferenceAPIError",
     "InferenceClient",

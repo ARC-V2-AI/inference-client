@@ -16,7 +16,6 @@ from ._shared import (
 from .types import (
     ChatContext,
     ChatResponse,
-    ConversationInfo,
     EmbeddingResponse,
     ModelInfo,
     StreamEvent,
@@ -64,7 +63,7 @@ class InferenceClient:
         self.model = _ModelResource(self)
         self.tokenizer = _TokenizerResource(self)
         self.context = _ContextResource(self)
-        self.conversations = _ConversationsResource(self)
+        self.runtime = _RuntimeResource(self)
 
     def request(self, method: str, path: str, *, json_body: Any = None, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         response = self._http.request(method, path.lstrip("/"), json=json_body, params=params)
@@ -112,10 +111,6 @@ class InferenceClient:
         return self.tokenizer.tokenize(
             input, add_bos=add_bos, special=special, include_tokens=include_tokens
         )
-
-    def conversation(self, *, system: str | None = None, title: str | None = None):
-        """Create a persisted server-side conversation, optionally with system instructions."""
-        return self.conversations.create(title=title, system=system)
 
     def agent(self, **kwargs: Any):
         from .agent import Agent
@@ -166,7 +161,7 @@ class AsyncInferenceClient:
         self.model = _AsyncModelResource(self)
         self.tokenizer = _AsyncTokenizerResource(self)
         self.context = _AsyncContextResource(self)
-        self.conversations = _AsyncConversationsResource(self)
+        self.runtime = _AsyncRuntimeResource(self)
 
     async def request(self, method: str, path: str, *, json_body: Any = None, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
         response = await self._http.request(method, path.lstrip("/"), json=json_body, params=params)
@@ -214,9 +209,6 @@ class AsyncInferenceClient:
         return await self.tokenizer.tokenize(
             input, add_bos=add_bos, special=special, include_tokens=include_tokens
         )
-
-    async def conversation(self, *, system: str | None = None, title: str | None = None):
-        return await self.conversations.create(title=title, system=system)
 
     def agent(self, **kwargs: Any):
         from .agent import AsyncAgent
@@ -383,7 +375,7 @@ class _ContextResource:
             if messages is None:
                 raise TypeError("messages or payload is required")
             payload = chat_payload(list(messages), **kwargs)
-        return ChatContext(self.client.request("POST", "chat/context", json_body=payload))
+        return ChatContext(self.client.request("POST", "context/inspect", json_body=payload))
 
 
 class _AsyncContextResource:
@@ -395,54 +387,36 @@ class _AsyncContextResource:
             if messages is None:
                 raise TypeError("messages or payload is required")
             payload = chat_payload(list(messages), **kwargs)
-        return ChatContext(await self.client.request("POST", "chat/context", json_body=payload))
+        return ChatContext(await self.client.request("POST", "context/inspect", json_body=payload))
 
 
-class _ConversationsResource:
+class _RuntimeResource:
+    """Runtime inspection and global cache controls (administrative scope)."""
+
     def __init__(self, client: InferenceClient) -> None:
         self.client = client
 
-    def create(self, *, title: str | None = None, system: str | None = None):
-        payload = {"title": title} if title is not None else {}
-        raw = self.client.request("POST", "conversations", json_body=payload)
-        from .conversation import Conversation
-        return Conversation(self.client, ConversationInfo(raw), system=system)
+    def status(self) -> dict[str, Any]:
+        return self.client.request("GET", "runtime/status")
 
-    def list(self) -> list[ConversationInfo]:
-        raw = self.client.request("GET", "conversations")
-        values = raw.get("data", raw.get("conversations", []))
-        return [ConversationInfo(dict(value)) for value in values if isinstance(value, Mapping)]
+    def memory(self) -> dict[str, Any]:
+        return self.client.request("GET", "runtime/memory")
 
-    def get(self, conversation_id: str):
-        raw = self.client.request("GET", f"conversations/{conversation_id}")
-        from .conversation import Conversation
-        return Conversation(self.client, ConversationInfo(raw))
-
-    def delete(self, conversation_id: str) -> bool:
-        self.client.request("DELETE", f"conversations/{conversation_id}")
-        return True
+    def clear_cache(self) -> dict[str, Any]:
+        return self.client.request("POST", "runtime/cache/clear")
 
 
-class _AsyncConversationsResource:
+class _AsyncRuntimeResource:
+    """Asynchronous runtime inspection and global cache controls."""
+
     def __init__(self, client: AsyncInferenceClient) -> None:
         self.client = client
 
-    async def create(self, *, title: str | None = None, system: str | None = None):
-        payload = {"title": title} if title is not None else {}
-        raw = await self.client.request("POST", "conversations", json_body=payload)
-        from .conversation import AsyncConversation
-        return AsyncConversation(self.client, ConversationInfo(raw), system=system)
+    async def status(self) -> dict[str, Any]:
+        return await self.client.request("GET", "runtime/status")
 
-    async def list(self) -> list[ConversationInfo]:
-        raw = await self.client.request("GET", "conversations")
-        values = raw.get("data", raw.get("conversations", []))
-        return [ConversationInfo(dict(value)) for value in values if isinstance(value, Mapping)]
+    async def memory(self) -> dict[str, Any]:
+        return await self.client.request("GET", "runtime/memory")
 
-    async def get(self, conversation_id: str):
-        raw = await self.client.request("GET", f"conversations/{conversation_id}")
-        from .conversation import AsyncConversation
-        return AsyncConversation(self.client, ConversationInfo(raw))
-
-    async def delete(self, conversation_id: str) -> bool:
-        await self.client.request("DELETE", f"conversations/{conversation_id}")
-        return True
+    async def clear_cache(self) -> dict[str, Any]:
+        return await self.client.request("POST", "runtime/cache/clear")
