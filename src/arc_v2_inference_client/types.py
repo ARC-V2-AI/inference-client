@@ -108,6 +108,15 @@ class ChatResponse:
     def finish_reason(self) -> str | None:
         choices = self.choices
         return choices[0].get("finish_reason") if choices else None
+    
+    @property
+    def warning(self) -> str | None:
+        choices = self.choices
+        if not choices:
+            return None
+
+        value = choices[0].get("warning")
+        return str(value) if value else None
 
     @property
     def usage(self) -> JSON:
@@ -136,6 +145,7 @@ class StreamEvent:
     text: str = ""
     reasoning: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
+    warning: str | None = None
 
     @classmethod
     def from_chunk(cls, value: JSON) -> "StreamEvent":
@@ -169,7 +179,10 @@ class StreamEvent:
             event_type = "finish"
         else:
             event_type = "chunk"
-        return cls(event_type, value, text, reasoning, calls)
+        
+        warning_value = choice.get("warning")
+        warning = str(warning_value) if warning_value else None
+        return cls(event_type, value, text, reasoning, calls, warning)
 
 
 @dataclass(frozen=True, slots=True)

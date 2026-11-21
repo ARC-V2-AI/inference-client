@@ -8,7 +8,14 @@ from typing import Any, TypeVar
 
 from .errors import AgentLoopError, ToolExecutionError
 from .tools import Tool, ensure_tool, serialize_result
-from .types import AgentEvent, AgentResult, AgentTrace, ChatResponse, StreamEvent, ToolCall
+from .types import (
+    AgentEvent,
+    AgentResult,
+    AgentTrace,
+    ChatResponse,
+    StreamEvent,
+    ToolCall,
+)
 
 T = TypeVar("T")
 
@@ -48,45 +55,101 @@ def _response_from_stream(events: list[StreamEvent]) -> ChatResponse:
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
     calls: dict[int, dict[str, str]] = {}
+
     finish_reason: str | None = None
+    warning: str | None = None
     raw_base: dict[str, Any] = {}
+
     for event in events:
         raw_base = event.data or raw_base
+
+        # Preserve warnings exposed directly by StreamEvent.
+        warning = getattr(event, "warning", None) or warning
+
         if event.text:
             text_parts.append(event.text)
+
         if event.reasoning:
             reasoning_parts.append(event.reasoning)
+
+        # Extract finish reason and warning from the raw API response.
         choices = event.data.get("choices") or []
+
         if choices and isinstance(choices[0], Mapping):
-            finish_reason = choices[0].get("finish_reason") or finish_reason
+            choice = choices[0]
+
+            finish_reason = choice.get("finish_reason") or finish_reason
+            warning = choice.get("warning") or warning
+
+        # Accumulate streamed tool-call fragments.
         for call in event.tool_calls:
-            state = calls.setdefault(call.index, {"id": "", "name": "", "arguments": ""})
+            state = calls.setdefault(
+                call.index,
+                {
+                    "id": "",
+                    "name": "",
+                    "arguments": "",
+                },
+            )
+
             if call.id:
                 state["id"] = call.id
+
             if call.name:
                 state["name"] += call.name
+
             if call.arguments:
                 state["arguments"] += call.arguments
 
-    tool_calls = [
-        {
-            "id": value["id"],
-            "type": "function",
-            "function": {"name": value["name"], "arguments": value["arguments"]},
-        }
-        for _, value in sorted(calls.items())
-    ]
-    message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts) or None}
+    # Only expose tool calls when generation completed with tool_calls.
+    # Incomplete tool-call fragments must never be treated as executable calls.
+    tool_calls = (
+        [
+            {
+                "id": value["id"],
+                "type": "function",
+                "function": {
+                    "name": value["name"],
+                    "arguments": value["arguments"],
+                },
+            }
+            for _, value in sorted(calls.items())
+        ]
+        if finish_reason == "tool_calls"
+        else []
+    )
+
+    # Construct the assistant message.
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "".join(text_parts) or None,
+    }
+
     if reasoning_parts:
         message["reasoning_content"] = "".join(reasoning_parts)
+
     if tool_calls:
         message["tool_calls"] = tool_calls
-    return ChatResponse({
-        "id": raw_base.get("id"),
-        "model": raw_base.get("model"),
-        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-        "usage": raw_base.get("usage") or {},
-    })
+
+    # Construct the response choice.
+    choice_response: dict[str, Any] = {
+        "index": 0,
+        "message": message,
+        "finish_reason": finish_reason,
+    }
+
+    # Preserve inference-runtime warnings in the reconstructed response.
+    if warning:
+        choice_response["warning"] = warning
+
+    return ChatResponse(
+        {
+            "id": raw_base.get("id"),
+            "model": raw_base.get("model"),
+            "choices": [choice_response],
+            "usage": raw_base.get("usage") or {},
+        }
+    )
 
 
 def _tool_messages(
@@ -193,6 +256,10 @@ class Agent:
             self._messages.append({"role": "system", "content": self.instructions})
         self.last_result: AgentResult | None = None
         self.add_tools(tools)
+    
+    @property
+    def warning(self) -> str | None:
+        return self.response.warning
 
     @property
     def messages(self) -> list[dict[str, Any]]:
