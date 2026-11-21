@@ -259,7 +259,11 @@ class Agent:
     
     @property
     def warning(self) -> str | None:
-        return self.response.warning
+        """Warning from the most recently completed agent response."""
+        if self.last_result is None:
+            return None
+    
+        return self.last_result.response.warning
 
     @property
     def messages(self) -> list[dict[str, Any]]:
